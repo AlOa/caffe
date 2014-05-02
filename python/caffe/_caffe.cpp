@@ -1,4 +1,4 @@
-// Copyright Yangqing Jia 2013
+// Copyright 2014 BVLC and contributors.
 // pycaffe provides a wrapper of the caffe::Net class as well as some
 // caffe::Caffe functions so that one could easily call it from Python.
 // Note that for python, we will simply use float as the data type.
@@ -32,6 +32,18 @@ using boost::python::object;
 using boost::python::handle;
 using boost::python::vector_indexing_suite;
 
+// for convenience, check that input files can be opened, and raise an
+// exception that boost will send to Python if not (caffe could still crash
+// later if the input files are disturbed before they are actually used, but
+// this saves frustration in most cases)
+static void CheckFile(const string& filename) {
+    std::ifstream f(filename.c_str());
+    if (!f.good()) {
+      f.close();
+      throw std::runtime_error("Could not open file " + filename);
+    }
+    f.close();
+}
 
 // wrap shared_ptr<Blob<float> > in a class that we construct in C++ and pass
 //  to Python
@@ -122,27 +134,27 @@ class CaffeLayer {
 
 // A simple wrapper over CaffeNet that runs the forward process.
 struct CaffeNet {
-  CaffeNet(string param_file, string pretrained_param_file) {
-    // for convenience, check that the input files can be opened, and raise
-    // an exception that boost will send to Python if not
-    // (this function could still crash if the input files are disturbed
-    //  before Net construction)
-    std::ifstream f(param_file.c_str());
-    if (!f.good()) {
-      f.close();
-      throw std::runtime_error("Could not open file " + param_file);
-    }
-    f.close();
-    f.open(pretrained_param_file.c_str());
-    if (!f.good()) {
-      f.close();
-      throw std::runtime_error("Could not open file " + pretrained_param_file);
-    }
-    f.close();
+  // For cases where parameters will be determined later by the Python user,
+  // create a Net with unallocated parameters (which will not be zero-filled
+  // when accessed).
+  explicit CaffeNet(string param_file) {
+    Init(param_file);
+  }
 
-    net_.reset(new Net<float>(param_file));
+  CaffeNet(string param_file, string pretrained_param_file) {
+    Init(param_file);
+    CheckFile(pretrained_param_file);
     net_->CopyTrainedLayersFrom(pretrained_param_file);
   }
+
+  explicit CaffeNet(shared_ptr<Net<float> > net)
+      : net_(net) {}
+
+  void Init(string param_file) {
+    CheckFile(param_file);
+    net_.reset(new Net<float>(param_file));
+  }
+
 
   virtual ~CaffeNet() {}
 
@@ -282,12 +294,32 @@ struct CaffeNet {
   shared_ptr<Net<float> > net_;
 };
 
+class CaffeSGDSolver {
+ public:
+  explicit CaffeSGDSolver(const string& param_file) {
+    // as in CaffeNet, (as a convenience, not a guarantee), create a Python
+    // exception if param_file can't be opened
+    CheckFile(param_file);
+    solver_.reset(new SGDSolver<float>(param_file));
+  }
+
+  CaffeNet net() { return CaffeNet(solver_->net()); }
+  void Solve() { return solver_->Solve(); }
+  void SolveResume(const string& resume_file) {
+    CheckFile(resume_file);
+    return solver_->Solve(resume_file);
+  }
+
+ protected:
+  shared_ptr<SGDSolver<float> > solver_;
+};
 
 
 // The boost python module definition.
 BOOST_PYTHON_MODULE(_caffe) {
   boost::python::class_<CaffeNet>(
-      "CaffeNet", boost::python::init<string, string>())
+      "Net", boost::python::init<string, string>())
+      .def(boost::python::init<string>())
       .def("Forward",          &CaffeNet::Forward)
       .def("ForwardPrefilled", &CaffeNet::ForwardPrefilled)
       .def("Backward",         &CaffeNet::Backward)
@@ -296,11 +328,12 @@ BOOST_PYTHON_MODULE(_caffe) {
       .def("set_phase_train",  &CaffeNet::set_phase_train)
       .def("set_phase_test",   &CaffeNet::set_phase_test)
       .def("set_device",       &CaffeNet::set_device)
-      .add_property("blobs",   &CaffeNet::blobs)
+      // rename blobs here since the pycaffe.py wrapper will replace it
+      .add_property("_blobs",  &CaffeNet::blobs)
       .add_property("layers",  &CaffeNet::layers);
 
   boost::python::class_<CaffeBlob, CaffeBlobWrap>(
-      "CaffeBlob", boost::python::no_init)
+      "Blob", boost::python::no_init)
       .add_property("name",     &CaffeBlob::name)
       .add_property("num",      &CaffeBlob::num)
       .add_property("channels", &CaffeBlob::channels)
@@ -311,9 +344,15 @@ BOOST_PYTHON_MODULE(_caffe) {
       .add_property("diff",     &CaffeBlobWrap::get_diff);
 
   boost::python::class_<CaffeLayer>(
-      "CaffeLayer", boost::python::no_init)
+      "Layer", boost::python::no_init)
       .add_property("name",  &CaffeLayer::name)
       .add_property("blobs", &CaffeLayer::blobs);
+
+  boost::python::class_<CaffeSGDSolver, boost::noncopyable>(
+      "SGDSolver", boost::python::init<string>())
+      .add_property("net", &CaffeSGDSolver::net)
+      .def("solve",        &CaffeSGDSolver::Solve)
+      .def("solve",        &CaffeSGDSolver::SolveResume);
 
   boost::python::class_<vector<CaffeBlob> >("BlobVec")
       .def(vector_indexing_suite<vector<CaffeBlob>, true>());
